@@ -1,0 +1,16 @@
+Pillow
+numpy
+pandas
+scikit-learn
+tqdm
+torch-fidelity
+diffusers
+transformers
+huggingface_hub
+huggingface-cli
+login
+lpips
+torchmetrics
+torchmetrics[image]
+lpips
+scipy

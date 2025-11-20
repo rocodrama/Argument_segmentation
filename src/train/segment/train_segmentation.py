@@ -1,0 +1,233 @@
+import os
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from pathlib import Path
+from PIL import Image
+from torchvision import transforms
+import numpy as np
+
+# SMP 라이브러리
+import segmentation_models_pytorch as smp
+from torch.utils.data import Dataset
+
+# ------------------------------
+# 1. 데이터셋 클래스
+# ------------------------------
+class MedicalMaskDataset(Dataset):
+    def __init__(self, img_dir, mask_dir, size=512):
+        self.img_dir = Path(img_dir)
+        self.mask_dir = Path(mask_dir)
+        self.size = size
+        
+        # 이미지 파일 찾기
+        self.images = sorted([f.name for f in self.img_dir.iterdir() if f.suffix.lower() in ['.jpg', '.png', '.jpeg', '.tiff', '.bmp']])
+        
+        # 전처리 (ImageNet 통계량 정규화)
+        self.transform = transforms.Compose([
+            transforms.Resize((size, size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # 마스크 전처리 (Nearest Neighbor Resize 필수)
+        self.mask_transform = transforms.Compose([
+            transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_name = self.images[idx]
+        img_path = self.img_dir / img_name
+        
+        # 1. 이미지 로드 (RGB)
+        image = Image.open(img_path).convert("RGB")
+        
+        # 2. 마스크 로드 (파일명 매칭 로직)
+        # 가정: 이미지 파일명과 마스크 파일명이 동일함 (확장자는 다를 수 있음)
+        # 만약 마스크 파일명이 'image_mask.png' 식이라면 아래 코드를 수정해야 함
+        mask_name = img_name  
+        mask_path = self.mask_dir / mask_name
+        
+        # 확장자가 다를 경우(예: 이미지는 jpg, 마스크는 png)를 대비한 예외처리
+        if not mask_path.exists():
+             # 흔한 마스크 확장자들 시도
+             for ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
+                 test_path = self.mask_dir / (Path(img_name).stem + ext)
+                 if test_path.exists():
+                     mask_path = test_path
+                     break
+        
+        # 그래도 없으면 에러 대신 빈 마스크 반환 (선택 사항)
+        if not mask_path.exists():
+            print(f"⚠️ 경고: 마스크 파일을 찾을 수 없음 - {mask_path}")
+            mask = Image.new("L", image.size, 0)
+        else:
+            mask = Image.open(mask_path).convert("L") # Grayscale
+        
+        return self.transform(image), self.mask_transform(mask)
+
+# ------------------------------
+# 2. 모델 선택 헬퍼
+# ------------------------------
+def get_model(model_name, encoder='resnet34', in_channels=3, classes=1):
+    print(f"🏗️ Model: {model_name} | Backbone: {encoder}")
+    
+    # SMP 라이브러리의 모델들
+    models = {
+        'Unet': smp.Unet,
+        'UnetPlusPlus': smp.UnetPlusPlus,
+        'DeepLabV3Plus': smp.DeepLabV3Plus,
+        'MAnet': smp.MAnet,
+        'FPN': smp.FPN,
+        'PAN': smp.PAN
+    }
+    
+    if model_name not in models:
+        raise ValueError(f"지원하지 않는 모델명입니다. 가능한 모델: {list(models.keys())}")
+    
+    return models[model_name](
+        encoder_name=encoder, 
+        encoder_weights='imagenet', 
+        in_channels=in_channels, 
+        classes=classes
+    )
+
+# ------------------------------
+# 3. 학습 함수
+# ------------------------------
+def train(args):
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # --- 데이터 로더 설정 ---
+    print("📂 데이터 로딩 중...")
+    # Train은 필수
+    train_dataset = MedicalMaskDataset(img_dir=args.train_img, mask_dir=args.train_mask, size=args.size)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    
+    # Validation은 선택 (경로가 주어졌을 때만 로드)
+    val_loader = None
+    if args.val_img and args.val_mask:
+        val_dataset = MedicalMaskDataset(img_dir=args.val_img, mask_dir=args.val_mask, size=args.size)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        print(f"📊 Data Count: Train={len(train_dataset)}, Val={len(val_dataset)}")
+    else:
+        print(f"📊 Data Count: Train={len(train_dataset)} (Validation 없음)")
+
+    # --- 모델 및 학습 설정 ---
+    model = get_model(args.model, encoder=args.encoder).to(device)
+    
+    # Loss: Dice Loss (Segmentation 국룰)
+    loss_fn = smp.losses.DiceLoss(mode='binary', from_logits=True)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    best_iou = 0.0
+    
+    # --- Main Loop ---
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0.0
+        
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        
+        for images, masks in loop:
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            optimizer.zero_grad()
+            
+            logits = model(images)
+            loss = loss_fn(logits, masks)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+        
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # --- Validation & Save ---
+        if val_loader:
+            model.eval()
+            val_loss = 0.0
+            
+            # IoU 계산용 리스트
+            tp_list, fp_list, fn_list, tn_list = [], [], [], []
+            
+            with torch.no_grad():
+                for images, masks in val_loader:
+                    images = images.to(device)
+                    masks = masks.to(device)
+                    
+                    logits = model(images)
+                    loss = loss_fn(logits, masks)
+                    val_loss += loss.item()
+                    
+                    # IoU 통계 수집
+                    pred_mask = (torch.sigmoid(logits) > 0.5).long()
+                    tp, fp, fn, tn = smp.metrics.get_stats(pred_mask, masks.long(), mode='binary', threshold=0.5)
+                    
+                    tp_list.append(tp); fp_list.append(fp)
+                    fn_list.append(fn); tn_list.append(tn)
+            
+            # 전체 배치에 대해 IoU 계산
+            iou_score = smp.metrics.iou_score(
+                torch.cat(tp_list), torch.cat(fp_list), 
+                torch.cat(fn_list), torch.cat(tn_list), 
+                reduction="micro-imagewise"
+            )
+            
+            avg_val_loss = val_loss / len(val_loader)
+            
+            print(f"   Scores: Train Loss={avg_train_loss:.4f} | Val Loss={avg_val_loss:.4f} | Val IoU={iou_score:.4f}")
+            
+            # Best Model 저장
+            if iou_score > best_iou:
+                best_iou = iou_score
+                save_path = os.path.join(args.output_dir, f"best_{args.model}_{args.encoder}.pth")
+                torch.save(model.state_dict(), save_path)
+                print(f"   🏆 New Best IoU! Saved: {save_path}")
+                
+        else:
+            print(f"   Scores: Train Loss={avg_train_loss:.4f}")
+            # Validation이 없으면 매 에포크마다 저장 (덮어쓰기)
+            save_path = os.path.join(args.output_dir, f"latest_{args.model}_{args.encoder}.pth")
+            torch.save(model.state_dict(), save_path)
+        
+        scheduler.step()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    
+    # 경로 관련 (수정된 부분)
+    parser.add_argument("--train_img", type=str, required=True, help="학습 이미지 폴더 경로")
+    parser.add_argument("--train_mask", type=str, required=True, help="학습 마스크 폴더 경로")
+    parser.add_argument("--val_img", type=str, default=None, help="검증 이미지 폴더 경로 (선택)")
+    parser.add_argument("--val_mask", type=str, default=None, help="검증 마스크 폴더 경로 (선택)")
+    
+    parser.add_argument("--output_dir", type=str, default="seg_results", help="모델 저장 경로")
+    
+    # 모델 설정
+    parser.add_argument("--model", type=str, default="DeepLabV3Plus", choices=['Unet', 'UnetPlusPlus', 'DeepLabV3Plus', 'MAnet', 'FPN'])
+    parser.add_argument("--encoder", type=str, default="resnet34")
+    
+    # 하이퍼파라미터
+    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--gpu", type=int, default=0)
+    
+    args = parser.parse_args()
+    train(args)
