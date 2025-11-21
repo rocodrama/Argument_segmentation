@@ -117,24 +117,27 @@ def validate(unet, vae, val_loader, noise_scheduler, scaling_factor, device):
     total_val_loss = 0.0
     num_batches = 0
     
+    # Validation도 AMP 적용 (메모리 절약 및 속도 향상)
     for batch in val_loader:
         clean_images = batch.to(device)
         bs = clean_images.shape[0]
 
-        # VAE Encoding
-        posterior = vae.encode(clean_images).latent_dist
-        latents = posterior.sample() * scaling_factor
+        with torch.cuda.amp.autocast():
+            # VAE Encoding
+            posterior = vae.encode(clean_images).latent_dist
+            latents = posterior.sample() * scaling_factor
 
-        # Add Noise
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=device).long()
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            # Add Noise
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=device).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Predict
-        noise_pred = unet(noisy_latents, timesteps).sample
+            # Predict
+            noise_pred = unet(noisy_latents, timesteps).sample
 
-        # Validation Loss
-        loss = F.mse_loss(noise_pred, noise)
+            # Validation Loss
+            loss = F.mse_loss(noise_pred, noise)
+            
         total_val_loss += loss.item()
         num_batches += 1
 
@@ -170,6 +173,9 @@ def train_ldm(args):
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.lr)
 
+    # [추가] GradScaler 초기화 (Mixed Precision Training용)
+    scaler = torch.cuda.amp.GradScaler()
+
     # --- 데이터 로더 ---
     train_dataset = MaskDataset(args.train_dir, size=args.resolution)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
@@ -181,7 +187,6 @@ def train_ldm(args):
         print(f"✅ Validation Set 로드됨: {len(val_dataset)}장")
 
     # --- Scaling Factor 계산 및 저장 ---
-    # Resume 시에는 파일에서 읽어오고, 처음이면 계산해서 저장
     scale_file = os.path.join(args.output_dir, "scaling_factor.txt")
     if args.resume and os.path.exists(scale_file):
         with open(scale_file, "r") as f:
@@ -210,20 +215,27 @@ def train_ldm(args):
             clean_images = batch.to(device)
             bs = clean_images.shape[0]
 
-            with torch.no_grad():
-                posterior = vae.encode(clean_images).latent_dist
-                latents = posterior.sample() * scaling_factor
-
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=device).long()
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            noise_pred = unet(noisy_latents, timesteps).sample
-            loss = F.mse_loss(noise_pred, noise)
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            # [수정] Autocast Context Manager 적용
+            with torch.cuda.amp.autocast():
+                # VAE Encoding 부분도 autocast 안에 넣어 연산 효율화
+                with torch.no_grad():
+                    posterior = vae.encode(clean_images).latent_dist
+                    latents = posterior.sample() * scaling_factor
+
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=device).long()
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Model Prediction
+                noise_pred = unet(noisy_latents, timesteps).sample
+                loss = F.mse_loss(noise_pred, noise)
+
+            # [수정] Scaler를 이용한 Backward & Step
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
             global_step += 1
@@ -247,16 +259,20 @@ def train_ldm(args):
             save_checkpoint(args.output_dir, epoch+1, unet, optimizer, global_step, is_best=False)
             
             unet.eval()
-            with torch.no_grad():
-                sample_noise = torch.randn(4, latent_channels, 64, 64).to(device)
-                for t in tqdm(noise_scheduler.timesteps, desc="Sampling", leave=False):
-                    model_output = unet(sample_noise, t).sample
-                    sample_noise = noise_scheduler.step(model_output, t, sample_noise).prev_sample
-                
-                images_decoded = vae.decode(sample_noise / scaling_factor).sample
-                images_decoded = (images_decoded / 2 + 0.5).clamp(0, 1)
-                save_path = os.path.join(sample_dir, f"sample_epoch_{epoch+1:04d}.png")
-                save_image(images_decoded, save_path, nrow=2)
+            # Sampling 시에도 autocast 적용 권장 (속도 향상)
+            with torch.cuda.amp.autocast():
+                with torch.no_grad():
+                    sample_noise = torch.randn(4, latent_channels, 64, 64).to(device)
+                    for t in tqdm(noise_scheduler.timesteps, desc="Sampling", leave=False):
+                        model_output = unet(sample_noise, t).sample
+                        sample_noise = noise_scheduler.step(model_output, t, sample_noise).prev_sample
+                    
+                    images_decoded = vae.decode(sample_noise / scaling_factor).sample
+                    images_decoded = (images_decoded / 2 + 0.5).clamp(0, 1)
+                    
+            # 이미지는 float32로 변환하여 저장 (안전성 확보)
+            save_path = os.path.join(sample_dir, f"sample_epoch_{epoch+1:04d}.png")
+            save_image(images_decoded.float(), save_path, nrow=2)
 
     print(f"🎉 학습 완료! Best Val Loss: {best_val_loss:.5f}")
     print(f"⚠️ 추론 시 Scaling Factor: {scaling_factor:.4f} (파일 저장됨: {scale_file})")
