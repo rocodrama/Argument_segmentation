@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -51,7 +50,7 @@ def compute_snr_scale(vae, dataloader, device, output_dir, num_batches=10):
     """
     Latent Scaling Factor를 계산하고 파일로 저장합니다.
     """
-    print("📊 Latent Scaling Factor 계산 중...")
+    print("Calculating Latent Scaling Factor...")
     vae.eval()
     latents = []
     with torch.no_grad():
@@ -65,13 +64,13 @@ def compute_snr_scale(vae, dataloader, device, output_dir, num_batches=10):
     std = latents.std().item()
     scale_factor = 1.0 / std
     
-    print(f"   -> 측정된 std: {std:.4f}, 권장 Scaling Factor: {scale_factor:.4f}")
+    print(f"   -> Measured std: {std:.4f}, Recommended Scaling Factor: {scale_factor:.4f}")
     
-    # 💾 Scaling Factor 파일 저장 (txt 파일)
+    # Scaling Factor 파일 저장 (txt 파일)
     save_path = os.path.join(output_dir, "scaling_factor.txt")
     with open(save_path, "w") as f:
         f.write(str(scale_factor))
-    print(f"💾 Scaling Factor 저장 완료: {save_path}")
+    print(f"Saved Scaling Factor to: {save_path}")
     
     return scale_factor
 
@@ -92,11 +91,11 @@ def save_checkpoint(output_dir, epoch, unet, optimizer, global_step, is_best=Fal
             "optimizer_state_dict": optimizer.state_dict(),
         }, state_path)
     
-    msg = "🏆 Best Model" if is_best else "💾 Checkpoint"
-    print(f"{msg} 저장 완료: {save_path}")
+    msg = "Best Model" if is_best else "Checkpoint"
+    print(f"Saved {msg}: {save_path}")
 
 def load_checkpoint(resume_path, unet, optimizer):
-    print(f"🔄 체크포인트 로드 중: {resume_path}")
+    print(f"Loading checkpoint: {resume_path}")
     unet_path = os.path.join(resume_path, "unet")
     loaded_unet = UNet2DModel.from_pretrained(unet_path)
     unet.load_state_dict(loaded_unet.state_dict())
@@ -117,7 +116,6 @@ def validate(unet, vae, val_loader, noise_scheduler, scaling_factor, device):
     total_val_loss = 0.0
     num_batches = 0
     
-    # Validation도 AMP 적용 (메모리 절약 및 속도 향상)
     for batch in val_loader:
         clean_images = batch.to(device)
         bs = clean_images.shape[0]
@@ -153,7 +151,7 @@ def train_ldm(args):
     os.makedirs(sample_dir, exist_ok=True)
 
     # --- VAE 로드 ---
-    print("❄️ VAE 로드 중...")
+    print("Loading VAE...")
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
     vae.requires_grad_(False)
     vae.eval()
@@ -173,7 +171,7 @@ def train_ldm(args):
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.lr)
 
-    # [추가] GradScaler 초기화 (Mixed Precision Training용)
+    # GradScaler 초기화 (Mixed Precision Training용)
     scaler = torch.cuda.amp.GradScaler()
 
     # --- 데이터 로더 ---
@@ -184,14 +182,14 @@ def train_ldm(args):
     if args.val_dir:
         val_dataset = MaskDataset(args.val_dir, size=args.resolution)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-        print(f"✅ Validation Set 로드됨: {len(val_dataset)}장")
+        print(f"Validation Set Loaded: {len(val_dataset)} images")
 
     # --- Scaling Factor 계산 및 저장 ---
     scale_file = os.path.join(args.output_dir, "scaling_factor.txt")
     if args.resume and os.path.exists(scale_file):
         with open(scale_file, "r") as f:
             scaling_factor = float(f.read().strip())
-        print(f"🔄 저장된 Scaling Factor 로드: {scaling_factor:.4f}")
+        print(f"Loaded Scaling Factor: {scaling_factor:.4f}")
     else:
         scaling_factor = compute_snr_scale(vae, train_loader, device, args.output_dir)
 
@@ -201,7 +199,7 @@ def train_ldm(args):
     if args.resume:
         start_epoch, global_step = load_checkpoint(args.resume, unet, optimizer)
 
-    print(f"🚀 LDM 학습 시작: Epoch {start_epoch} ~ {args.epochs}")
+    print(f"Start LDM Training: Epoch {start_epoch} ~ {args.epochs}")
     
     best_val_loss = float('inf')
 
@@ -209,17 +207,16 @@ def train_ldm(args):
         unet.train()
         train_loss = 0.0
         
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        print(f"\n[Epoch {epoch+1}/{args.epochs}] Start")
         
-        for step, batch in enumerate(progress_bar):
+        for step, batch in enumerate(train_loader):
             clean_images = batch.to(device)
             bs = clean_images.shape[0]
 
             optimizer.zero_grad()
 
-            # [수정] Autocast Context Manager 적용
+            # Autocast Context Manager 적용
             with torch.cuda.amp.autocast():
-                # VAE Encoding 부분도 autocast 안에 넣어 연산 효율화
                 with torch.no_grad():
                     posterior = vae.encode(clean_images).latent_dist
                     latents = posterior.sample() * scaling_factor
@@ -232,56 +229,61 @@ def train_ldm(args):
                 noise_pred = unet(noisy_latents, timesteps).sample
                 loss = F.mse_loss(noise_pred, noise)
 
-            # [수정] Scaler를 이용한 Backward & Step
+            # Scaler를 이용한 Backward & Step
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.item()
             global_step += 1
-            progress_bar.set_postfix({"Train Loss": loss.item()})
+            
+            # 로그 출력 (매 50 step 마다)
+            if (step + 1) % 50 == 0:
+                print(f"  Step [{step+1}/{len(train_loader)}] Loss: {loss.item():.5f}")
 
         avg_train_loss = train_loss / len(train_loader)
         
         # --- Validation 수행 ---
         if val_loader:
             avg_val_loss = validate(unet, vae, val_loader, noise_scheduler, scaling_factor, device)
-            print(f"[Epoch {epoch+1}] Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
+            print(f"Done Epoch {epoch+1} | Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 save_checkpoint(args.output_dir, epoch+1, unet, optimizer, global_step, is_best=True)
         else:
-            print(f"[Epoch {epoch+1}] Train Loss: {avg_train_loss:.5f}")
+            print(f"Done Epoch {epoch+1} | Train Loss: {avg_train_loss:.5f}")
 
         # --- 주기적 저장 및 샘플링 ---
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(args.output_dir, epoch+1, unet, optimizer, global_step, is_best=False)
             
+            print("  Generating sample...")
             unet.eval()
-            # Sampling 시에도 autocast 적용 권장 (속도 향상)
+            # Sampling 시에도 autocast 적용
             with torch.cuda.amp.autocast():
                 with torch.no_grad():
                     sample_noise = torch.randn(4, latent_channels, 64, 64).to(device)
-                    for t in tqdm(noise_scheduler.timesteps, desc="Sampling", leave=False):
+                    # Sampling loop (tqdm 제거)
+                    for t in noise_scheduler.timesteps:
                         model_output = unet(sample_noise, t).sample
                         sample_noise = noise_scheduler.step(model_output, t, sample_noise).prev_sample
                     
                     images_decoded = vae.decode(sample_noise / scaling_factor).sample
                     images_decoded = (images_decoded / 2 + 0.5).clamp(0, 1)
                     
-            # 이미지는 float32로 변환하여 저장 (안전성 확보)
             save_path = os.path.join(sample_dir, f"sample_epoch_{epoch+1:04d}.png")
             save_image(images_decoded.float(), save_path, nrow=2)
+            print(f"  Sample saved: {save_path}")
 
-    print(f"🎉 학습 완료! Best Val Loss: {best_val_loss:.5f}")
-    print(f"⚠️ 추론 시 Scaling Factor: {scaling_factor:.4f} (파일 저장됨: {scale_file})")
+    print(f"Training Complete. Best Val Loss: {best_val_loss:.5f}")
+    print(f"Inference Scaling Factor: {scaling_factor:.4f} (File saved: {scale_file})")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", type=str, required=True, help="학습 데이터(마스크) 폴더")
-    parser.add_argument("--val_dir", type=str, default=None, help="검증 데이터(마스크) 폴더 (선택)")
-    parser.add_argument("--vae_path", type=str, required=True, help="학습된 VAE 폴더")
+    parser.add_argument("--train_dir", type=str, required=True, help="Train mask folder")
+    parser.add_argument("--val_dir", type=str, default=None, help="Val mask folder (optional)")
+    parser.add_argument("--vae_path", type=str, required=True, help="Pretrained VAE folder")
     parser.add_argument("--output_dir", type=str, default="ldm_result")
     parser.add_argument("--resume", type=str, default=None)
     

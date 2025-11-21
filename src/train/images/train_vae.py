@@ -21,7 +21,6 @@ def calculate_psnr(img1, img2):
     img1, img2: [B, C, H, W], Range: [0, 1]
     """
     mse = torch.mean((img1 - img2) ** 2, dim=[1, 2, 3])
-    # 0으로 나누기 방지
     if mse.item() == 0:
         return 100.0 
     return 20 * torch.log10(1.0 / torch.sqrt(mse)).mean().item()
@@ -29,32 +28,33 @@ def calculate_psnr(img1, img2):
 # ------------------------------
 # 1. 데이터셋 정의
 # ------------------------------
-class MaskDataset(Dataset):
-    def __init__(self, mask_dir, size=512):
-        self.mask_dir = Path(mask_dir)
+class ImageDataset(Dataset):
+    def __init__(self, img_dir, size=512):
+        self.img_dir = Path(img_dir)
         self.size = size
-        self.masks = sorted([
-            f for f in os.listdir(mask_dir) 
+        self.images = sorted([
+            f for f in os.listdir(img_dir) 
             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp'))
         ])
         
         self.transform = transforms.Compose([
             transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
+            transforms.Normalize([0.5], [0.5]) # [-1, 1] 범위로 정규화
         ])
 
     def __len__(self):
-        return len(self.masks)
+        return len(self.images)
 
     def __getitem__(self, index):
-        path = self.mask_dir / self.masks[index]
+        path = self.img_dir / self.images[index]
         try:
-            img = Image.open(path).convert("L")
+            # VAE 모델 구조에 따라 채널 수 맞춤 (기본 3채널)
+            img = Image.open(path).convert("RGB")
             return self.transform(img)
         except Exception as e:
             print(f"Error loading {path}: {e}")
-            return torch.zeros(1, self.size, self.size)
+            return torch.zeros(3, self.size, self.size)
 
 # ------------------------------
 # 2. 학습 메인 함수
@@ -65,16 +65,16 @@ def train_vae(args):
     # 디렉토리 설정
     os.makedirs(args.output_dir, exist_ok=True)
     image_log_dir = os.path.join(args.output_dir, 'samples')
-    ckpt_dir = os.path.join(args.output_dir, 'checkpoints')
-    best_model_dir = os.path.join(args.output_dir, 'best_vae') # Best 모델 저장 경로
+    best_model_dir = os.path.join(args.output_dir, 'best_vae') 
     
     os.makedirs(image_log_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(best_model_dir, exist_ok=True)
 
-    # 모델 초기화
+    # --- 모델 초기화 ---
+    # Stable Diffusion V1.4/1.5와 동일한 구조 (Latent Channel = 4)
     vae = AutoencoderKL(
-        in_channels=1,
-        out_channels=1,
+        in_channels=3,
+        out_channels=3,
         down_block_types=["DownEncoderBlock2D"] * 4,
         up_block_types=["UpDecoderBlock2D"] * 4,
         block_out_channels=[128, 256, 512, 512],
@@ -86,8 +86,12 @@ def train_vae(args):
     ).to(device)
 
     optimizer = torch.optim.AdamW(vae.parameters(), lr=args.lr)
+    
+    # [AMP] GradScaler 초기화
+    scaler = torch.cuda.amp.GradScaler()
 
-    dataset = MaskDataset(args.input_dir, size=args.resolution)
+    # --- 데이터 로더 ---
+    dataset = ImageDataset(args.input_dir, size=args.resolution)
     train_loader = DataLoader(
         dataset, 
         batch_size=args.batch_size, 
@@ -98,86 +102,102 @@ def train_vae(args):
 
     print(f"Start VAE Training")
     print(f" - Data Size: {len(dataset)}")
-    print(f" - Epochs: {args.epochs}")
+    print(f" - Batch Size: {args.batch_size} (Accum: {args.gradient_accumulation_steps})")
 
-    # Best PSNR 기록용 변수 초기화
     best_psnr = 0.0
+    global_step = 0
 
     for epoch in range(args.epochs):
         vae.train()
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
         
-        # Epoch 시작 로그
         print(f"\n[Epoch {epoch+1}/{args.epochs}] Start")
         
+        optimizer.zero_grad()
+
         for step, batch in enumerate(train_loader):
             images = batch.to(device)
 
-            # Forward
-            posterior = vae.encode(images).latent_dist
-            z = posterior.sample()
-            reconstruction = vae.decode(z).sample
+            # [AMP] Autocast 적용
+            with torch.cuda.amp.autocast():
+                # Forward Pass
+                posterior = vae.encode(images).latent_dist
+                z = posterior.sample()
+                reconstruction = vae.decode(z).sample
 
-            # Loss
-            recon_loss = F.l1_loss(reconstruction, images)
-            kl_loss = posterior.kl().mean()
-            loss = recon_loss + (args.kl_weight * kl_loss)
+                # Loss 계산
+                recon_loss = F.mse_loss(reconstruction, images, reduction='mean')
+                kl_loss = posterior.kl().mean()
+                
+                loss = recon_loss + (args.kl_weight * kl_loss)
+                
+                # [Accumulation] Loss 나누기
+                loss = loss / args.gradient_accumulation_steps
 
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # [AMP] Backward
+            scaler.scale(loss).backward()
 
-            epoch_loss += loss.item()
+            # [Accumulation] Step 수행
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                global_step += 1
+
+            # 로깅 (원래 스케일로 복원)
+            current_loss = loss.item() * args.gradient_accumulation_steps
+            epoch_loss += current_loss
             epoch_recon_loss += recon_loss.item()
-
+            
             # 중간 로그 출력 (매 50 step 마다)
             if (step + 1) % 50 == 0:
-                print(f"  Step [{step+1}/{len(train_loader)}] L1 Loss: {recon_loss.item():.5f}")
+                print(f"  Step [{step+1}/{len(train_loader)}] Loss: {current_loss:.5f}")
 
         # --- Epoch 종료 후 평가 ---
         avg_loss = epoch_loss / len(train_loader)
         
-        # PSNR 계산 (학습 데이터의 마지막 배치 사용)
+        # 간이 평가 (마지막 배치의 PSNR 확인)
         with torch.no_grad():
+            # 시각화를 위해 [-1, 1] -> [0, 1]
             orig_norm = (images / 2 + 0.5).clamp(0, 1)
             recon_norm = (reconstruction / 2 + 0.5).clamp(0, 1)
             current_psnr = calculate_psnr(orig_norm, recon_norm)
 
-        # 결과 출력 (이모지 제거)
-        print(f"Done Epoch {epoch+1} | Loss: {avg_loss:.5f} | PSNR: {current_psnr:.2f} dB (Best: {best_psnr:.2f} dB)")
+        print(f"Done Epoch {epoch+1} | Total Loss: {avg_loss:.5f} | PSNR: {current_psnr:.2f} dB (Best: {best_psnr:.2f} dB)")
 
-        # Best Model 저장
+        # Best Model 저장 (PSNR 기준)
         if current_psnr > best_psnr:
             best_psnr = current_psnr
             print(f"New Best PSNR ({best_psnr:.2f} dB) -> Saving model...")
             vae.save_pretrained(best_model_dir)
             
+            # 비교 이미지 저장
             comparison = torch.cat([orig_norm[:4], recon_norm[:4]], dim=0)
             save_image(comparison, os.path.join(image_log_dir, f"best_sample_psnr{best_psnr:.1f}.png"), nrow=4)
 
         # 주기적 저장
         if (epoch + 1) % args.save_interval == 0:
-            save_path = os.path.join(ckpt_dir, f"vae_epoch_{epoch+1}")
-            vae.save_pretrained(save_path)
-            
             comparison = torch.cat([orig_norm[:4], recon_norm[:4]], dim=0)
             save_image(comparison, os.path.join(image_log_dir, f"epoch_{epoch+1:04d}.png"), nrow=4)
 
     print(f"Training Complete. Final Best PSNR: {best_psnr:.2f} dB")
-    print(f"Best Model Path: {best_model_dir}")
+    print(f"Saved Path: {best_model_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", type=str, required=True, help="Mask image folder")
+    parser.add_argument("--input_dir", type=str, required=True, help="Input image folder")
     parser.add_argument("--output_dir", type=str, default="vae_result", help="Output directory")
+    
+    # 학습 설정
     parser.add_argument("--resolution", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--kl_weight", type=float, default=1e-6)
+    
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_interval", type=int, default=5)
     parser.add_argument("--gpu", type=int, default=0)
     
