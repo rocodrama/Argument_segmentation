@@ -16,14 +16,10 @@ from diffusers import AutoencoderKL
 # 유틸리티: PSNR 계산 함수
 # ------------------------------
 def calculate_psnr(img1, img2):
-    """
-    이미지 배치(Batch) 간의 평균 PSNR 계산
-    img1, img2: [B, C, H, W], Range: [0, 1]
-    """
-    mse = torch.mean((img1 - img2) ** 2, dim=[1, 2, 3])
+    mse = torch.mean((img1 - img2) ** 2) # dim 인자 제거
     if mse.item() == 0:
         return 100.0 
-    return 20 * torch.log10(1.0 / torch.sqrt(mse)).mean().item()
+    return 20 * torch.log10(1.0 / torch.sqrt(mse)).item()
 
 # ------------------------------
 # 1. 데이터셋 정의
@@ -32,9 +28,15 @@ class ImageDataset(Dataset):
     def __init__(self, img_dir, size=512):
         self.img_dir = Path(img_dir)
         self.size = size
+        
+        # 지원 확장자 목록
+        extensions = {'.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
+        
+        # 하위 폴더를 포함하지 않고 해당 폴더만 검색 (기존 로직 유지)
+        # 만약 하위 폴더까지 찾으려면 os.walk 또는 Path.rglob 사용 필요
         self.images = sorted([
             f for f in os.listdir(img_dir) 
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp'))
+            if os.path.splitext(f)[-1].lower() in extensions
         ])
         
         self.transform = transforms.Compose([
@@ -70,28 +72,43 @@ def train_vae(args):
     os.makedirs(image_log_dir, exist_ok=True)
     os.makedirs(best_model_dir, exist_ok=True)
 
-    # --- 모델 초기화 ---
-    # Stable Diffusion V1.4/1.5와 동일한 구조 (Latent Channel = 4)
-    vae = AutoencoderKL(
-        in_channels=3,
-        out_channels=3,
-        down_block_types=["DownEncoderBlock2D"] * 4,
-        up_block_types=["UpDecoderBlock2D"] * 4,
-        block_out_channels=[128, 256, 512, 512],
-        latent_channels=4,
-        layers_per_block=2,
-        act_fn="silu",
-        norm_num_groups=32,
-        sample_size=args.resolution
-    ).to(device)
+    # --- 모델 초기화 또는 불러오기 ---
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume path not found: {args.resume}")
+        
+        print(f"Resuming training from: {args.resume}")
+        # 저장된 설정과 가중치를 로드 (AutoencoderKL 구조 자동 인식)
+        vae = AutoencoderKL.from_pretrained(args.resume)
+    else:
+        print("Initializing new VAE model...")
+        # Stable Diffusion V1.4/1.5와 동일한 구조 (Latent Channel = 4)
+        vae = AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            down_block_types=["DownEncoderBlock2D"] * 4,
+            up_block_types=["UpDecoderBlock2D"] * 4,
+            block_out_channels=[128, 256, 512, 512],
+            latent_channels=4,
+            layers_per_block=2,
+            act_fn="silu",
+            norm_num_groups=32,
+            sample_size=args.resolution
+        )
+    
+    vae = vae.to(device)
 
     optimizer = torch.optim.AdamW(vae.parameters(), lr=args.lr)
     
-    # [AMP] GradScaler 초기화
-    scaler = torch.cuda.amp.GradScaler()
+    # [AMP] GradScaler 초기화 (최신 버전 대응)
+    # torch.cuda.amp.GradScaler() -> torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda')
 
     # --- 데이터 로더 ---
     dataset = ImageDataset(args.input_dir, size=args.resolution)
+    if len(dataset) == 0:
+        raise ValueError(f"No images found in {args.input_dir}")
+
     train_loader = DataLoader(
         dataset, 
         batch_size=args.batch_size, 
@@ -119,8 +136,8 @@ def train_vae(args):
         for step, batch in enumerate(train_loader):
             images = batch.to(device)
 
-            # [AMP] Autocast 적용
-            with torch.cuda.amp.autocast():
+            # [AMP] Autocast 적용 (device_type 명시)
+            with torch.amp.autocast('cuda'):
                 # Forward Pass
                 posterior = vae.encode(images).latent_dist
                 z = posterior.sample()
@@ -188,6 +205,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", type=str, required=True, help="Input image folder")
     parser.add_argument("--output_dir", type=str, default="vae_result", help="Output directory")
+    
+    # 추가된 Resume 옵션
+    parser.add_argument("--resume", type=str, default=None, help="Path to the checkpoint folder to resume from")
     
     # 학습 설정
     parser.add_argument("--resolution", type=int, default=512)
