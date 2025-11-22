@@ -274,11 +274,50 @@ def train(args):
                         save_image(vis, os.path.join(best_sample_dir, save_name))
                         print(f"     Saved Best Sample: {save_name} (PSNR: {current_psnr:.2f} dB)")
 
-        # 주기적 Checkpoint 백업
+        # --- 주기적 Checkpoint 백업 & 샘플링 (추가됨) ---
         if (epoch + 1) % args.save_interval == 0:
+            # 1. 모델 저장
             checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
             unet.save_pretrained(checkpoint_path)
-            print(f"  [Backup] Checkpoint saved: {checkpoint_path}")
+            print(f"  [Backup] Generating sample for epoch {epoch+1}...")
+            
+            # 2. 샘플 이미지 생성
+            unet.eval()
+            # Validation 셋이 없으면 Train 셋에서 하나 가져오기
+            loader = val_loader if val_loader else train_loader
+            sample_batch = next(iter(loader))
+            
+            sample_mask = sample_batch['mask'][:1].to(device)
+            sample_gt = sample_batch['image'][:1].to(device)
+
+            with torch.amp.autocast('cuda'):
+                with torch.no_grad():
+                    # Mask Latent
+                    sample_mask_latent = vae_mask.encode(sample_mask).latent_dist.sample() * SD_SCALING_FACTOR
+                    
+                    # Random Noise
+                    latents = torch.randn(1, 4, 64, 64).to(device)
+                    
+                    # Diffusion Process
+                    for t in noise_scheduler.timesteps:
+                        input_latents = torch.cat([latents, sample_mask_latent], dim=1)
+                        model_output = unet(input_latents, t).sample
+                        latents = noise_scheduler.step(model_output, t, latents).prev_sample
+
+                    # Decode
+                    decoded_img = vae_image.decode(latents / SD_SCALING_FACTOR).sample
+                    
+                    # Visualize [Mask(3ch) | Generated | GT]
+                    sample_mask_vis = sample_mask.repeat(1, 3, 1, 1)
+                    vis = torch.cat([sample_mask_vis, decoded_img, sample_gt], dim=3)
+                    vis = (vis / 2 + 0.5).clamp(0, 1).float() 
+                    
+                    # Save
+                    sample_save_path = os.path.join(args.output_dir, f"sample_epoch_{epoch+1}.png")
+                    save_image(vis, sample_save_path)
+                    print(f"  [Backup] Checkpoint & Sample saved: {checkpoint_path}")
+            
+            unet.train() # 다시 학습 모드로 복귀
 
     print("Training Complete.")
 
