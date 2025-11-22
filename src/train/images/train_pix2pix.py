@@ -1,7 +1,7 @@
 import os
 import argparse
 import numpy as np
-import re  # 파일명에서 에폭 파싱용
+import re
 from PIL import Image
 from pathlib import Path
 
@@ -11,12 +11,10 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 
-# 평가 메트릭
 import lpips
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
-# pix2pix_model.py가 같은 폴더에 있어야 합니다.
 from pix2pix_model import UnetGenerator, NLayerDiscriminator, weights_init_normal
 
 # ------------------------------
@@ -57,6 +55,10 @@ def train(args):
     
     best_sample_dir = os.path.join(args.output_dir, 'best_samples')
     os.makedirs(best_sample_dir, exist_ok=True)
+    
+    # 체크포인트 샘플 저장용 폴더 (선택사항, 여기서는 output_dir에 바로 저장)
+    # ckpt_sample_dir = os.path.join(args.output_dir, 'checkpoint_samples')
+    # os.makedirs(ckpt_sample_dir, exist_ok=True)
 
     # 데이터셋 로드
     train_dataset = PairedDataset(args.data_dir, split='train', size=args.size)
@@ -87,33 +89,30 @@ def train(args):
     optimizer_G = torch.optim.Adam(netG.parameters(), lr=args.lr, betas=(0.5, 0.999))
     optimizer_D = torch.optim.Adam(netD.parameters(), lr=args.lr, betas=(0.5, 0.999))
 
-    # --- Resume (학습 재개) 로직 ---
+    # --- Resume ---
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"Loading Generator checkpoint: {args.resume}")
             netG.load_state_dict(torch.load(args.resume, map_location=device))
             
-            # 1. 파일명에서 에폭 파싱 (예: netG_epoch_50.pth -> 50)
             match = re.search(r'epoch_(\d+)', os.path.basename(args.resume))
             if match:
                 start_epoch = int(match.group(1))
                 print(f" -> Resuming from epoch {start_epoch + 1}")
             
-            # 2. Discriminator도 로드 시도 (netG -> netD로 이름 변경)
             resume_d = args.resume.replace('netG', 'netD')
             if os.path.isfile(resume_d):
                 print(f"Loading Discriminator checkpoint: {resume_d}")
                 netD.load_state_dict(torch.load(resume_d, map_location=device))
             else:
-                print("Warning: Discriminator checkpoint not found. Starting D from scratch (might be unstable).")
+                print("Warning: Discriminator checkpoint not found. Starting D from scratch.")
         else:
             print(f"Checkpoint file not found: {args.resume}")
 
     print_freq = 10
     best_psnr = 0.0 
 
-    # loop range 수정: start_epoch부터 시작
     for epoch in range(start_epoch, args.epochs):
         netG.train()
         netD.train()
@@ -168,23 +167,38 @@ def train(args):
                 print(f"  ★ New Best PSNR! ({best_psnr:.2f} -> {avg_psnr:.2f}) Saving Model & Sample...")
                 best_psnr = avg_psnr
                 
-                # Best Model 저장 (Generator + Discriminator)
                 torch.save(netG.state_dict(), os.path.join(args.output_dir, 'best_pix2pix_netG.pth'))
                 torch.save(netD.state_dict(), os.path.join(args.output_dir, 'best_pix2pix_netD.pth'))
-                
                 save_image(vis_img, os.path.join(best_sample_dir, f'best_psnr{best_psnr:.2f}_epoch{epoch+1}.png'))
 
-        # --- 주기적 저장 (save_interval) ---
+        # --- 주기적 저장 (save_interval) & 샘플 생성 ---
         if (epoch + 1) % args.save_interval == 0:
-            # Generator 저장
+            # 1. 모델 저장
             save_path_G = os.path.join(args.output_dir, f'netG_epoch_{epoch+1}.pth')
-            torch.save(netG.state_dict(), save_path_G)
-            
-            # [추가] Discriminator 저장 (Resume을 위해 필요)
             save_path_D = os.path.join(args.output_dir, f'netD_epoch_{epoch+1}.pth')
+            torch.save(netG.state_dict(), save_path_G)
             torch.save(netD.state_dict(), save_path_D)
             
-            print(f"  Checkpoint saved: {save_path_G}")
+            # 2. 체크포인트 샘플 이미지 생성 및 저장 (추가된 부분)
+            netG.eval()
+            with torch.no_grad():
+                # Val 셋이 있으면 Val에서, 없으면 Train에서 하나 가져오기
+                loader_for_sample = val_loader if val_loader else train_loader
+                sample_batch = next(iter(loader_for_sample))
+                
+                real_A = sample_batch['A'].to(device)
+                real_B = sample_batch['B'].to(device)
+                fake_B = netG(real_A)
+                
+                # [Mask | Ground Truth | Generated]
+                vis = torch.cat((real_A, real_B, fake_B), dim=3)
+                vis = (vis + 1) / 2.0 # Denormalize
+                
+                sample_path = os.path.join(args.output_dir, f'sample_epoch_{epoch+1}.png')
+                save_image(vis, sample_path)
+            
+            netG.train() # 다시 학습 모드로 복귀
+            print(f"  Checkpoint & Sample saved: {save_path_G}")
 
 @torch.no_grad()
 def evaluate(netG, val_loader, loss_fn_lpips, device):
@@ -224,9 +238,7 @@ if __name__ == "__main__":
     parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--gpu', type=int, default=0)
-    
-    # Resume 옵션 추가
-    parser.add_argument('--resume', type=str, default=None, help='Path to netG checkpoint to resume from')
+    parser.add_argument('--resume', type=str, default=None)
     
     args = parser.parse_args()
     train(args)
