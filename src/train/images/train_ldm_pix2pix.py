@@ -57,10 +57,18 @@ class PairedDataset(Dataset):
 
             assert len(self.mask_files) == len(self.image_files), f"[{split}] Mask and Image counts mismatch."
 
-        self.transform = transforms.Compose([
+        # [수정됨] 이미지(RGB, 3ch)용 변환기
+        self.image_transform = transforms.Compose([
             transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]) # [-1, 1]
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 3채널 정규화
+        ])
+
+        # [수정됨] 마스크(Grayscale, 1ch)용 변환기
+        self.mask_transform = transforms.Compose([
+            transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]) # 1채널 정규화
         ])
 
     def __len__(self):
@@ -68,14 +76,16 @@ class PairedDataset(Dataset):
 
     def __getitem__(self, idx):
         mask_path = self.mask_files[idx]
-        mask = Image.open(mask_path).convert("RGB")
-        
         img_path = self.image_files[idx]
+
+        # [수정됨] 마스크는 Grayscale("L")로 로드
+        mask = Image.open(mask_path).convert("L")
+        # 이미지는 RGB로 로드
         image = Image.open(img_path).convert("RGB")
         
         return {
-            'mask': self.transform(mask), 
-            'image': self.transform(image)
+            'mask': self.mask_transform(mask),   # 1채널 변환 적용
+            'image': self.image_transform(image) # 3채널 변환 적용
         }
 
 # ------------------------------
@@ -92,14 +102,14 @@ def train(args):
     # --- [Step 1] 두 개의 VAE 로드 ---
     print("Loading VAE models...")
     
-    # (1) Image VAE (Target용: 정답 이미지를 인코딩/디코딩)
+    # (1) Image VAE (Target용: RGB 3채널)
     if args.image_vae_path:
         print(f" -> Loading Image VAE from: {args.image_vae_path}")
         vae_image = AutoencoderKL.from_pretrained(args.image_vae_path).to(device)
     else:
         raise ValueError("Please provide --image_vae_path")
 
-    # (2) Mask VAE (Condition용: 입력 마스크를 인코딩)
+    # (2) Mask VAE (Condition용: Grayscale 1채널)
     if args.mask_vae_path:
         print(f" -> Loading Mask VAE from: {args.mask_vae_path}")
         vae_mask = AutoencoderKL.from_pretrained(args.mask_vae_path).to(device)
@@ -114,6 +124,7 @@ def train(args):
 
     # --- [Step 2] UNet 초기화 ---
     # 입력 채널 = Noisy Image Latent(4) + Mask Latent(4) = 8
+    # (참고: VAE 입력 채널이 1개라도 Latent 채널은 설정에 따라 4개가 나옵니다)
     unet = UNet2DModel(
         sample_size=args.resolution // 8,
         in_channels=8, 
@@ -169,9 +180,12 @@ def train(args):
             bs = images.shape[0]
 
             with torch.amp.autocast('cuda'):
-                # 1. Encoding (Image -> Image VAE, Mask -> Mask VAE)
+                # 1. Encoding 
                 with torch.no_grad():
+                    # Image -> Image VAE (3ch Input -> 4ch Latent)
                     latents = vae_image.encode(images).latent_dist.sample() * SD_SCALING_FACTOR
+                    
+                    # Mask -> Mask VAE (1ch Input -> 4ch Latent)
                     mask_latents = vae_mask.encode(masks).latent_dist.sample() * SD_SCALING_FACTOR
 
                 # 2. Add Noise
@@ -272,12 +286,15 @@ def train(args):
                     # Decoding (Image VAE)
                     decoded_img = vae_image.decode(latents / SD_SCALING_FACTOR).sample
                     
-                    # Calculate PSNR (Generated vs Ground Truth)
+                    # 시각화를 위해 마스크 채널 복제 (1ch -> 3ch)
+                    sample_mask_vis = sample_mask.repeat(1, 3, 1, 1)
+                    
+                    # Calculate PSNR
                     current_psnr = calculate_psnr(sample_gt, decoded_img)
                     print(f"  [Sample Quality] PSNR: {current_psnr:.2f} dB")
 
-                    # Save Visualization: [Mask] | [Generated] | [Target]
-                    vis = torch.cat([sample_mask, decoded_img, sample_gt], dim=3)
+                    # Save Visualization: [Mask(3ch)] | [Generated] | [Target]
+                    vis = torch.cat([sample_mask_vis, decoded_img, sample_gt], dim=3)
                     vis = (vis / 2 + 0.5).clamp(0, 1).float() 
                     save_image(vis, os.path.join(sample_dir, f"val_epoch_{epoch+1}_psnr{current_psnr:.1f}.png"))
 
