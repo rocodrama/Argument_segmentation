@@ -23,7 +23,6 @@ def calculate_psnr(img1, img2):
     이미지 품질 평가 (Peak Signal-to-Noise Ratio)
     img1, img2: [B, C, H, W], Range: [-1, 1] or [0, 1]
     """
-    # [-1, 1] 범위라면 [0, 1]로 변환
     if img1.min() < 0:
         img1 = (img1 / 2 + 0.5).clamp(0, 1)
     if img2.min() < 0:
@@ -50,25 +49,24 @@ class PairedDataset(Dataset):
              self.mask_files = []
              self.image_files = []
         else:
-            # 파일명 매칭 (확장자 필터링)
             exts = ['.jpg', '.png', '.jpeg', '.tiff', '.bmp']
             self.mask_files = sorted([f for f in self.mask_dir.iterdir() if f.suffix.lower() in exts])
             self.image_files = sorted([f for f in self.image_dir.iterdir() if f.suffix.lower() in exts])
 
             assert len(self.mask_files) == len(self.image_files), f"[{split}] Mask and Image counts mismatch."
 
-        # [수정됨] 이미지(RGB, 3ch)용 변환기
+        # 이미지(RGB, 3ch)용 변환기
         self.image_transform = transforms.Compose([
             transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 3채널 정규화
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) 
         ])
 
-        # [수정됨] 마스크(Grayscale, 1ch)용 변환기
+        # 마스크(Grayscale, 1ch)용 변환기
         self.mask_transform = transforms.Compose([
             transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]) # 1채널 정규화
+            transforms.Normalize([0.5], [0.5]) 
         ])
 
     def __len__(self):
@@ -78,14 +76,14 @@ class PairedDataset(Dataset):
         mask_path = self.mask_files[idx]
         img_path = self.image_files[idx]
 
-        # [수정됨] 마스크는 Grayscale("L")로 로드
+        # 마스크는 Grayscale("L")로 로드
         mask = Image.open(mask_path).convert("L")
         # 이미지는 RGB로 로드
         image = Image.open(img_path).convert("RGB")
         
         return {
-            'mask': self.mask_transform(mask),   # 1채널 변환 적용
-            'image': self.image_transform(image) # 3채널 변환 적용
+            'mask': self.mask_transform(mask),   
+            'image': self.image_transform(image) 
         }
 
 # ------------------------------
@@ -94,76 +92,73 @@ class PairedDataset(Dataset):
 def train(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     
-    # 결과 저장 경로 생성
     os.makedirs(args.output_dir, exist_ok=True)
-    sample_dir = os.path.join(args.output_dir, "samples")
-    os.makedirs(sample_dir, exist_ok=True)
+    # Best Sample 저장용 폴더
+    best_sample_dir = os.path.join(args.output_dir, "best_samples")
+    os.makedirs(best_sample_dir, exist_ok=True)
 
     # --- [Step 1] 두 개의 VAE 로드 ---
     print("Loading VAE models...")
     
-    # (1) Image VAE (Target용: RGB 3채널)
     if args.image_vae_path:
         print(f" -> Loading Image VAE from: {args.image_vae_path}")
         vae_image = AutoencoderKL.from_pretrained(args.image_vae_path).to(device)
     else:
         raise ValueError("Please provide --image_vae_path")
 
-    # (2) Mask VAE (Condition용: Grayscale 1채널)
     if args.mask_vae_path:
         print(f" -> Loading Mask VAE from: {args.mask_vae_path}")
         vae_mask = AutoencoderKL.from_pretrained(args.mask_vae_path).to(device)
     else:
         raise ValueError("Please provide --mask_vae_path")
 
-    # VAE는 학습하지 않고 고정(Freeze)
     vae_image.requires_grad_(False)
     vae_image.eval()
     vae_mask.requires_grad_(False)
     vae_mask.eval()
 
-    # --- [Step 2] UNet 초기화 ---
-    # 입력 채널 = Noisy Image Latent(4) + Mask Latent(4) = 8
-    # (참고: VAE 입력 채널이 1개라도 Latent 채널은 설정에 따라 4개가 나옵니다)
-    unet = UNet2DModel(
-        sample_size=args.resolution // 8,
-        in_channels=8, 
-        out_channels=4, # Image Latent의 Noise 예측
-        layers_per_block=2,
-        block_out_channels=(128, 256, 512, 512),
-        down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-        up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
-    ).to(device)
+    # --- [Step 2] UNet 초기화 (Resume 지원) ---
+    if args.resume:
+        print(f"Resuming training from checkpoint: {args.resume}")
+        # 저장된 폴더에서 모델 구조와 가중치를 자동으로 로드
+        unet = UNet2DModel.from_pretrained(args.resume).to(device)
+    else:
+        print("Initializing new UNet model...")
+        unet = UNet2DModel(
+            sample_size=args.resolution // 8,
+            in_channels=8, 
+            out_channels=4, 
+            layers_per_block=2,
+            block_out_channels=(128, 256, 512, 512),
+            down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
+        ).to(device)
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler('cuda')
 
-    # --- [Step 3] 데이터 로더 (Train & Val) ---
+    # --- [Step 3] 데이터 로더 ---
     print("Preparing Datasets...")
     
-    # Train Loader
     train_dataset = PairedDataset(args.data_dir, split='train', size=args.resolution)
-    if len(train_dataset) == 0:
-        raise ValueError("No training data found.")
-        
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     
-    # Val Loader
     val_dataset = PairedDataset(args.data_dir, split='val', size=args.resolution)
     if len(val_dataset) > 0:
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
         print(f"   - Train Size: {len(train_dataset)}")
         print(f"   - Val Size:   {len(val_dataset)}")
     else:
-        print("   - Warning: No validation data found. Validation loop will be skipped.")
+        print("   - Warning: No validation data found.")
         val_loader = None
 
     print(f"Start Training for {args.epochs} epochs")
 
     # --- [Step 4] 학습 루프 ---
     global_step = 0
-    
+    best_val_loss = float('inf') # Best Loss 추적용
+
     for epoch in range(args.epochs):
         # ==========================
         #      Training Loop
@@ -180,30 +175,20 @@ def train(args):
             bs = images.shape[0]
 
             with torch.amp.autocast('cuda'):
-                # 1. Encoding 
                 with torch.no_grad():
-                    # Image -> Image VAE (3ch Input -> 4ch Latent)
                     latents = vae_image.encode(images).latent_dist.sample() * SD_SCALING_FACTOR
-                    
-                    # Mask -> Mask VAE (1ch Input -> 4ch Latent)
                     mask_latents = vae_mask.encode(masks).latent_dist.sample() * SD_SCALING_FACTOR
 
-                # 2. Add Noise
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # 3. Concatenate [Noisy Image Latent, Mask Latent]
                 unet_input = torch.cat([noisy_latents, mask_latents], dim=1)
-                
-                # 4. Predict Noise
                 noise_pred = unet(unet_input, timesteps).sample
                 
-                # 5. Loss Calculation
                 loss = F.mse_loss(noise_pred, noise)
                 loss_accum = loss / args.gradient_accumulation_steps
 
-            # Backward
             scaler.scale(loss_accum).backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
@@ -250,68 +235,63 @@ def train(args):
             
             avg_val_loss = val_loss_sum / len(val_loader)
             print(f"  >> End Epoch {epoch+1} | Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
-        else:
-            print(f"  >> End Epoch {epoch+1} | Train Loss: {avg_train_loss:.5f}")
 
+            # --- ★ Best Model Save & Sampling ★ ---
+            if avg_val_loss < best_val_loss:
+                print(f"  ★ New Best Val Loss! ({best_val_loss:.5f} -> {avg_val_loss:.5f})")
+                best_val_loss = avg_val_loss
+                
+                # 1. Best Model 저장
+                best_save_path = os.path.join(args.output_dir, "best_unet")
+                unet.save_pretrained(best_save_path)
+                print(f"     Saved Best Model to: {best_save_path}")
+                
+                # 2. Best 일 때만 샘플 이미지 생성
+                print(f"     Generating Best Sample...")
+                sample_batch = next(iter(val_loader))
+                sample_mask = sample_batch['mask'][:1].to(device)
+                sample_gt = sample_batch['image'][:1].to(device)
 
-        # ==========================
-        #    Save & Sampling
-        # ==========================
+                with torch.amp.autocast('cuda'):
+                    with torch.no_grad():
+                        sample_mask_latent = vae_mask.encode(sample_mask).latent_dist.sample() * SD_SCALING_FACTOR
+                        latents = torch.randn(1, 4, 64, 64).to(device)
+                        
+                        for t in noise_scheduler.timesteps:
+                            input_latents = torch.cat([latents, sample_mask_latent], dim=1)
+                            model_output = unet(input_latents, t).sample
+                            latents = noise_scheduler.step(model_output, t, latents).prev_sample
+
+                        decoded_img = vae_image.decode(latents / SD_SCALING_FACTOR).sample
+                        
+                        sample_mask_vis = sample_mask.repeat(1, 3, 1, 1)
+                        current_psnr = calculate_psnr(sample_gt, decoded_img)
+                        
+                        vis = torch.cat([sample_mask_vis, decoded_img, sample_gt], dim=3)
+                        vis = (vis / 2 + 0.5).clamp(0, 1).float() 
+                        
+                        save_name = f"best_loss{best_val_loss:.4f}_psnr{current_psnr:.1f}_ep{epoch+1}.png"
+                        save_image(vis, os.path.join(best_sample_dir, save_name))
+                        print(f"     Saved Best Sample: {save_name} (PSNR: {current_psnr:.2f} dB)")
+
+        # 주기적 Checkpoint 백업
         if (epoch + 1) % args.save_interval == 0:
-            print(f"  Saving checkpoint and sampling...")
-            save_path = os.path.join(args.output_dir, f"unet_epoch_{epoch+1}")
-            unet.save_pretrained(save_path)
-            
-            # Sampling (Validation 데이터 중 하나 선택)
-            unet.eval()
-            sample_batch = next(iter(val_loader)) if val_loader else next(iter(train_loader))
-            
-            sample_mask = sample_batch['mask'][:1].to(device)
-            sample_gt = sample_batch['image'][:1].to(device)
-
-            with torch.amp.autocast('cuda'):
-                with torch.no_grad():
-                    # Mask Encoding (Mask VAE)
-                    sample_mask_latent = vae_mask.encode(sample_mask).latent_dist.sample() * SD_SCALING_FACTOR
-                    
-                    # Random Start Noise
-                    latents = torch.randn(1, 4, 64, 64).to(device)
-                    
-                    # Denoising Process
-                    for t in noise_scheduler.timesteps:
-                        input_latents = torch.cat([latents, sample_mask_latent], dim=1)
-                        model_output = unet(input_latents, t).sample
-                        latents = noise_scheduler.step(model_output, t, latents).prev_sample
-
-                    # Decoding (Image VAE)
-                    decoded_img = vae_image.decode(latents / SD_SCALING_FACTOR).sample
-                    
-                    # 시각화를 위해 마스크 채널 복제 (1ch -> 3ch)
-                    sample_mask_vis = sample_mask.repeat(1, 3, 1, 1)
-                    
-                    # Calculate PSNR
-                    current_psnr = calculate_psnr(sample_gt, decoded_img)
-                    print(f"  [Sample Quality] PSNR: {current_psnr:.2f} dB")
-
-                    # Save Visualization: [Mask(3ch)] | [Generated] | [Target]
-                    vis = torch.cat([sample_mask_vis, decoded_img, sample_gt], dim=3)
-                    vis = (vis / 2 + 0.5).clamp(0, 1).float() 
-                    save_image(vis, os.path.join(sample_dir, f"val_epoch_{epoch+1}_psnr{current_psnr:.1f}.png"))
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
+            unet.save_pretrained(checkpoint_path)
+            print(f"  [Backup] Checkpoint saved: {checkpoint_path}")
 
     print("Training Complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
-    # 데이터셋 경로 (train/val 폴더 포함)
-    parser.add_argument("--data_dir", type=str, required=True, help="Root dataset path containing 'train' and 'val' folders")
+    parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="ldm_dual_vae_result")
+    parser.add_argument("--mask_vae_path", type=str, required=True)
+    parser.add_argument("--image_vae_path", type=str, required=True)
     
-    # 두 개의 VAE 모델 경로 (필수)
-    parser.add_argument("--mask_vae_path", type=str, required=True, help="Path to the pre-trained Mask VAE folder")
-    parser.add_argument("--image_vae_path", type=str, required=True, help="Path to the pre-trained Image VAE folder")
+    # Resume 옵션 추가
+    parser.add_argument("--resume", type=str, default=None, help="Path to the UNet folder to resume from")
     
-    # 학습 하이퍼파라미터
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
