@@ -193,10 +193,16 @@ def train_vae(args):
             comparison = torch.cat([orig_norm[:4], recon_norm[:4]], dim=0)
             save_image(comparison, os.path.join(image_log_dir, f"best_sample_psnr{best_psnr:.1f}.png"), nrow=4)
 
-        # 주기적 저장
+        # [수정됨] 주기적 저장 (이미지 샘플 + 모델 체크포인트)
         if (epoch + 1) % args.save_interval == 0:
+            # 1. 비교 이미지 저장
             comparison = torch.cat([orig_norm[:4], recon_norm[:4]], dim=0)
             save_image(comparison, os.path.join(image_log_dir, f"epoch_{epoch+1:04d}.png"), nrow=4)
+            
+            # 2. 체크포인트 폴더 저장
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
+            vae.save_pretrained(checkpoint_path)
+            print(f"Checkpoint saved: {checkpoint_path}")
 
     print(f"Training Complete. Final Best PSNR: {best_psnr:.2f} dB")
     print(f"Saved Path: {best_model_dir}")
