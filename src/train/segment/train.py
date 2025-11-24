@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-# from tqdm import tqdm  <-- 제거됨
 from pathlib import Path
 from PIL import Image
 from torchvision import transforms
@@ -23,17 +22,14 @@ class MedicalMaskDataset(Dataset):
         self.mask_dir = Path(mask_dir)
         self.size = size
         
-        # 이미지 파일 찾기
         self.images = sorted([f.name for f in self.img_dir.iterdir() if f.suffix.lower() in ['.jpg', '.png', '.jpeg', '.tiff', '.bmp']])
         
-        # 전처리 (ImageNet 통계량 정규화)
         self.transform = transforms.Compose([
             transforms.Resize((size, size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # 마스크 전처리
         self.mask_transform = transforms.Compose([
             transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor()
@@ -46,10 +42,8 @@ class MedicalMaskDataset(Dataset):
         img_name = self.images[idx]
         img_path = self.img_dir / img_name
         
-        # 1. 이미지 로드 (RGB)
         image = Image.open(img_path).convert("RGB")
         
-        # 2. 마스크 로드 (파일명 매칭 로직)
         mask_name = img_name  
         mask_path = self.mask_dir / mask_name
         
@@ -100,7 +94,6 @@ def train(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # --- 데이터 로더 설정 ---
     print("📂 데이터 로딩 중...")
     train_dataset = MedicalMaskDataset(img_dir=args.train_img, mask_dir=args.train_mask, size=args.size)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -113,42 +106,32 @@ def train(args):
     else:
         print(f"📊 Data Count: Train={len(train_dataset)} (Validation 없음)")
 
-    # --- 모델 및 학습 설정 ---
     model = get_model(args.model, encoder=args.encoder).to(device)
-    
     loss_fn = smp.losses.DiceLoss(mode='binary', from_logits=True)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     best_iou = 0.0
-    print_freq = 10  # 로그 출력 주기 (배치 단위)
     
-    # --- Main Loop ---
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
         
-        print(f"\n[Epoch {epoch+1}/{args.epochs}] Start Training...")
+        # [수정됨] 불필요한 배치 로그 제거
+        print(f"\n[Epoch {epoch+1}/{args.epochs}] Training...")
         
-        # tqdm 제거하고 enumerate 사용
         for i, (images, masks) in enumerate(train_loader):
             images = images.to(device)
             masks = masks.to(device)
             
             optimizer.zero_grad()
-            
             logits = model(images)
             loss = loss_fn(logits, masks)
-            
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
-            
-            # Print 로그 출력
-            if (i + 1) % print_freq == 0:
-                print(f"  Batch [{i+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
         
         avg_train_loss = train_loss / len(train_loader)
         
@@ -182,20 +165,30 @@ def train(args):
             
             avg_val_loss = val_loss / len(val_loader)
             
-            print(f"  >> End Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {iou_score:.4f}")
+            print(f"  >> Result: Train Loss={avg_train_loss:.4f} | Val Loss={avg_val_loss:.4f} | Val IoU={iou_score:.4f}")
             
+            # 1. Best Model 저장
             if iou_score > best_iou:
                 best_iou = iou_score
-                save_path = os.path.join(args.output_dir, f"best_{args.model}_{args.encoder}.pth")
-                torch.save(model.state_dict(), save_path)
-                print(f"  🏆 New Best IoU! Saved: {save_path}")
-                
+                best_save_path = os.path.join(args.output_dir, f"best_{args.model}_{args.encoder}.pth")
+                torch.save(model.state_dict(), best_save_path)
+                print(f"  🏆 New Best IoU! Saved: {best_save_path}")
+            
+            # 2. Latest Model 저장 (매 에폭 덮어쓰기)
+            latest_save_path = os.path.join(args.output_dir, f"latest_{args.model}_{args.encoder}.pth")
+            torch.save(model.state_dict(), latest_save_path)
+            
         else:
-            print(f"  >> End Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f}")
-            save_path = os.path.join(args.output_dir, f"latest_{args.model}_{args.encoder}.pth")
-            torch.save(model.state_dict(), save_path)
+            # Validation 없는 경우
+            print(f"  >> Result: Train Loss={avg_train_loss:.4f}")
+            
+            # Latest Model 저장
+            latest_save_path = os.path.join(args.output_dir, f"latest_{args.model}_{args.encoder}.pth")
+            torch.save(model.state_dict(), latest_save_path)
         
         scheduler.step()
+
+    print("Training Complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

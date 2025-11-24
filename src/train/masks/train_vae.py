@@ -17,14 +17,17 @@ from diffusers import AutoencoderKL
 # ------------------------------
 def calculate_psnr(img1, img2):
     """
-    이미지 배치(Batch) 간의 평균 PSNR 계산
-    img1, img2: [B, C, H, W], Range: [0, 1]
+    이미지 배치(Batch) 간의 평균 PSNR 계산 (수정됨)
     """
-    mse = torch.mean((img1 - img2) ** 2, dim=[1, 2, 3])
-    # 0으로 나누기 방지
-    if mse.item() == 0:
+    # 전체 평균(Scalar)을 구해서 차원 문제를 방지합니다.
+    mse = torch.mean((img1 - img2) ** 2)
+    
+    # 0으로 나누기 방지 (아주 작은 값 더하기)
+    if mse.item() <= 1e-10:
         return 100.0 
-    return 20 * torch.log10(1.0 / torch.sqrt(mse)).mean().item()
+        
+    psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
+    return psnr.item()
 
 # ------------------------------
 # 1. 데이터셋 정의
